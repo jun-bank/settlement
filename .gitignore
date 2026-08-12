@@ -1,0 +1,19 @@
+build/
+.gradle/
+.kotlin/
+out/
+*.class
+*.jar
+!gradle/wrapper/gradle-wrapper.jar
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+
+# 로컬 설정
+local.properties
+gradle.properties.local
+*.env
