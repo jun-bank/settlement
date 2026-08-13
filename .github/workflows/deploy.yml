@@ -1,0 +1,273 @@
+name: deploy-request
+
+# main에 이미지가 올라간 뒤(build-and-push 성공) 배포-agent에 배포를 "요청"한다.
+# 실행은 agent가 한다 — 이 워크플로는 서명된 요청 하나를 만들 뿐이다(ADR-027 RL-7:
+# 배포 실행 주체는 agent 하나, 서비스는 요청만 한다).
+#
+# 요청 = manifest(JSON body) + 게이트 2개:
+#   게이트 1 (HMAC)  : canonical = "POST\n/deploy\nsha256:<body>\n<reqId>\n<issued>\n<expires>"
+#                      → HMAC-SHA256(AGENT_HMAC_KEY, canonical) → hex → X-Deploy-Signature
+#                      (auth.Canonicalize / auth.Sign 과 짝 — 한쪽만 바뀌면 전부 불일치)
+#   게이트 2 (OIDC)  : GitHub Actions id-token(audience=OIDC_AUDIENCE) → X-Deploy-Oidc-Token
+#                      claim 행렬(iss·aud·repository·repository_id·owner_id·ref·job_workflow_ref)이
+#                      agent의 OIDC_* 정책과 정확히 일치해야 통과(internal/auth/oidc.go checkClaims).
+#
+# ⚠️ job_workflow_ref 결박: 이 파일 경로·이름(deploy.yml)·브랜치(main)가 agent의
+#    OIDC_JOB_WORKFLOW_REF=jun-bank/settlement/.github/workflows/deploy.yml@refs/heads/main 과
+#    정확히 같아야 게이트 2를 통과한다. 파일명·위치를 바꾸면 agent 설정도 함께 바꿔야 한다.
+
+on:
+  # CI(build-and-push)가 main에서 성공하면 자동으로 배포를 요청한다.
+  workflow_run:
+    workflows: ["build-and-push"]
+    types: [completed]
+  # 수동 트리거(첫 e2e·재배포용). sha를 비우면 현재 main HEAD.
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "배포할 커밋 SHA (비우면 현재 main HEAD)"
+        required: false
+
+permissions:
+  contents: read
+  packages: read     # GHCR 이미지 digest 조회
+  id-token: write     # 게이트 2 OIDC 토큰 발급
+
+# 배포 요청은 동시에 하나만 — 겹친 요청이 배포 창 락을 두고 경합하지 않도록 직렬화한다.
+concurrency:
+  group: deploy-settlement
+  cancel-in-progress: false
+
+jobs:
+  request-deploy:
+    runs-on: ubuntu-latest
+    # workflow_run으로 왔으면 CI가 성공했을 때만(실패한 빌드의 이미지를 배포하지 않는다).
+    # ⚠️ 성공 여부만으로는 부족하다 — build-and-push는 workflow_dispatch로 아무 브랜치에서나
+    #    돌 수 있고, 그때 이 워크플로는 기본 브랜치 컨텍스트(ref=main)로 실행된다. 그러면
+    #    비-main 이미지가 main 신원의 OIDC 토큰을 달고 배포 요청이 된다 — agent의 ref 결박이
+    #    CD층에서 우회된다. 그래서 빌드가 선 브랜치가 기본 브랜치인지 여기서 함께 본다.
+    # ⚠️ 브랜치 이름만으로는 또 부족하다 — fork에서 온 빌드의 head_branch는 fork 쪽 이름이라
+    #    공격자가 자기 fork의 브랜치를 "main"으로 지으면 그대로 통과한다. 그때 이 워크플로는
+    #    base repo 컨텍스트(정상 HMAC 시크릿 + main 신원 OIDC)로 돌기 때문에, 남의 커밋이
+    #    우리 신원으로 배포 요청이 된다. 그래서 빌드가 선 저장소가 우리인지까지 본다.
+    #    event == 'push'는 그 위의 한 겹 — 기본 브랜치에 실제로 머지된 빌드만 자동 배포로
+    #    잇는다(수동 빌드로 배포하고 싶으면 이 워크플로의 workflow_dispatch를 쓴다).
+    # 수동 dispatch는 조건 없이 진행한다.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_repository.full_name == github.repository &&
+       github.event.workflow_run.head_branch == github.event.repository.default_branch)
+    env:
+      IMAGE_REPO: ghcr.io/jun-bank/settlement
+      AGENT_URL: https://deploy.junproject.xyz/deploy
+      OIDC_AUDIENCE: https://deploy.junproject.xyz
+      TARGET: settlement
+      # 배포 요청에 동봉할 정본 compose와, 그 안의 배포 대상 서비스명(manifest.appService).
+      # 경로를 셸 본문에 적지 않고 env로 넘기는 것은 아래 다른 입력들과 같은 이유다.
+      COMPOSE_FILE: deploy/compose.yml
+      APP_SERVICE: app
+    steps:
+      - name: 배포 대상 SHA 확정
+        id: sha
+        # ⚠️ 표현식 보간값은 셸 스크립트 본문에 직접 넣지 않는다 — 보간은 셸이 읽기 전에
+        #    일어나므로 사용자가 넣은 문자열이 그대로 명령이 된다(입력 sha 한 칸으로
+        #    AGENT_HMAC_KEY·OIDC 토큰까지 닿는다). env로 넘기고 셸에서는 "$VAR"만 쓴다.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_SHA: ${{ github.event.inputs.sha }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_run" ]; then
+            SHA="$RUN_SHA"
+          elif [ -n "${INPUT_SHA:-}" ]; then
+            SHA="$INPUT_SHA"
+          else
+            SHA="$HEAD_SHA"
+          fi
+          # 값 자체도 검증한다(env 인용은 주입을 막고, 이 검사는 쓰레기 값이 이미지 태그·
+          # manifest·서명까지 흘러가는 것을 막는다). 빈 입력은 위에서 이미 HEAD로 간다.
+          if [[ ! "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::배포 대상 SHA 형식 오류(40자리 소문자 hex 아님): '$SHA'"
+            exit 1
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "배포 대상 커밋: $SHA"
+
+      # 동봉할 compose는 "배포하는 그 커밋"의 것이어야 한다. 워크플로가 도는 ref(항상 main)의
+      # 파일을 쓰면, 배포 대상 SHA와 실행될 compose가 서로 다른 시점에서 오는 어긋남이 생긴다.
+      # 그래서 manifest의 commitSha와 같은 SHA를 찍어서 받아온다.
+      - name: 정본 compose 체크아웃 (배포 대상 커밋의 것)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.sha.outputs.sha }}
+          # 이 워크스페이스에서 git push 할 일이 없다 — 토큰을 남기지 않는다.
+          persist-credentials: false
+          # 필요한 것은 compose 한 장뿐이라 그것만 받는다(cone 모드 아님 — 경로 그대로).
+          sparse-checkout: deploy/compose.yml
+          sparse-checkout-cone-mode: false
+
+      - name: GHCR 로그인
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 이미지 digest 조회 (내용 주소 고정 — 태그 금지)
+        id: digest
+        env:
+          SHA: ${{ steps.sha.outputs.sha }}
+        run: |
+          set -euo pipefail
+          DIGEST=$(docker buildx imagetools inspect "${IMAGE_REPO}:${SHA}" --format '{{.Manifest.Digest}}')
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::이미지 digest 형식 오류(sha256:64hex 아님): '$DIGEST'"
+            exit 1
+          fi
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "이미지: ${IMAGE_REPO}@${DIGEST}"
+
+      - name: manifest 조립 + 서명 + 배포 요청 전송
+        # ACTIONS_ID_TOKEN_REQUEST_URL/TOKEN 은 id-token: write 권한이 있으면 런너가
+        # 런타임 환경변수로 자동 주입한다 — env로 다시 매핑하지 않는다(빈 값으로 덮일 위험).
+        env:
+          AGENT_HMAC_KEY: ${{ secrets.AGENT_HMAC_KEY }}
+          SHA: ${{ steps.sha.outputs.sha }}
+          DIGEST: ${{ steps.digest.outputs.digest }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          if [ -z "${AGENT_HMAC_KEY:-}" ]; then
+            echo "::error::AGENT_HMAC_KEY 시크릿이 비어 있다(조직 시크릿 AGENT_HMAC_KEY 확인)"
+            exit 1
+          fi
+
+          REQ_ID="settlement-${RUN_ID}-${RUN_ATTEMPT}"
+          ISSUED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          EXPIRES=$(date -u -d '+5 minutes' +%Y-%m-%dT%H:%M:%SZ)
+
+          # manifest = DO-18 6칸 + compose 동봉 3칸(ADR-030 CP-1·CP-3 · infra#19).
+          # 정본 compose(deploy/compose.yml)를 base64로 싣고, 그 원문의 sha256을
+          # composeRevision으로 함께 서명한다. agent는 서명이 증명한 이 바이트를 자기
+          # workspace에 기록하고 그 파일로만 compose up 한다 — 호스트에 남아 있는 낡은
+          # compose가 실행될 길이 없어진다. appService는 배포 대상 서비스명이고, agent의
+          # DEPLOY_APP_SERVICE·compose 정의·이 값 셋이 일치해야 통과한다(CP-3).
+          #
+          # ⚠️ 해시와 base64는 같은 메모리 버퍼 하나에서 뽑는다. 파일을 두 번 읽으면 그
+          #    사이의 사소한 차이(후행 개행 처리 같은)가 revision과 내용의 불일치로 남고,
+          #    그건 배포 현장에서야 드러난다. 그래서 조립을 셸 파이프로 잇지 않고 python
+          #    한 프로세스 안에서 끝낸다. 구분자 없는 compact JSON이라 바이트도 결정적이다
+          #    (digest·서명이 이 바이트에 정확히 걸린다 — 이후 manifest.json은 손대지 않는다).
+          # 아래 python은 입력을 전부 os.environ에서 읽는다. REQ_ID는 이 셸에서 만든 값이라
+          # 반드시 export가 필요하고, 나머지는 step·job env로 이미 환경에 있지만 함께 적어
+          # 둔다 — "이 변수들이 자식 프로세스까지 간다"가 눈으로 확정되는 편이 낫다(무해).
+          # 값이 없는 변수는 export 해도 환경에 실리지 않아, python이 KeyError로 멈춘다.
+          export REQ_ID SHA DIGEST TARGET APP_SERVICE COMPOSE_FILE
+          python3 - <<'PY'
+          import base64, hashlib, json, os
+
+
+          def fail(msg):
+              print("::error::" + msg)
+              raise SystemExit(1)
+
+
+          path = os.environ["COMPOSE_FILE"]
+          with open(path, "rb") as f:
+              raw = f.read()          # 정본 compose는 여기서 딱 한 번 읽는다
+          if not raw:
+              fail("정본 compose가 비어 있다: " + path)
+
+          revision = "sha256:" + hashlib.sha256(raw).hexdigest()
+          content = base64.b64encode(raw).decode("ascii")
+
+          body = json.dumps({
+              "target": os.environ["TARGET"],
+              "commitSha": os.environ["SHA"],
+              "imageDigest": os.environ["DIGEST"],
+              "composeRevision": revision,
+              "composeContent": content,
+              "appService": os.environ["APP_SERVICE"],
+              "configVersion": "v1",
+              "requestId": os.environ["REQ_ID"],
+          }, separators=(",", ":")).encode("utf-8")
+
+          # 발행 전 자가 검증 — 방금 만든 manifest를 다시 뜯어서, 동봉된 내용이 정말
+          # composeRevision이 가리키는 바이트인지 우리 손으로 확인한다. 여기서 걸리면
+          # 요청을 보내지 않는다(agent가 거절해 주기를 기대하지 않는다).
+          got = json.loads(body.decode("utf-8"))
+          decoded = base64.b64decode(got["composeContent"], validate=True)
+          if base64.b64encode(decoded).decode("ascii") != got["composeContent"]:
+              fail("composeContent base64 재인코딩 불일치(표준 base64·패딩 확인)")
+          if decoded != raw:
+              fail("composeContent 디코드 결과가 원본 compose 바이트와 다르다")
+          if "sha256:" + hashlib.sha256(decoded).hexdigest() != got["composeRevision"]:
+              fail("composeRevision이 동봉 내용의 sha256과 불일치 — 발행 중단")
+          if not got["appService"]:
+              fail("appService가 비어 있다(CP-3 — 배포 대상 서비스명 필수)")
+          # 요청 body 상한(64KiB)의 절반을 CI에서 미리 막는다(CP-6).
+          if len(body) > 32768:
+              fail("manifest 크기 %d바이트 > 32768 상한(CP-6)" % len(body))
+
+          with open("manifest.json", "wb") as f:
+              f.write(body)
+          print("manifest %d바이트 · composeRevision=%s · appService=%s"
+                % (len(body), got["composeRevision"], got["appService"]))
+          PY
+
+          # 게이트 1 — body digest("sha256:"+hex) + canonical 문자열(개행 조인·trailing 없음) + HMAC hex.
+          BODY_HEX=$(sha256sum manifest.json | cut -d' ' -f1)
+          BODY_DIGEST="sha256:${BODY_HEX}"
+          printf '%s\n%s\n%s\n%s\n%s\n%s' "POST" "/deploy" "$BODY_DIGEST" "$REQ_ID" "$ISSUED" "$EXPIRES" > canonical.bin
+          SIG=$(openssl dgst -sha256 -hmac "$AGENT_HMAC_KEY" -binary canonical.bin | xxd -p -c 256)
+          if [[ ! "$SIG" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::HMAC 서명 생성 실패"
+            exit 1
+          fi
+
+          # 게이트 2 — OIDC id-token(우리 배포 전용 audience). 값은 마스킹한다.
+          OIDC_TOKEN=$(curl -sf \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${OIDC_AUDIENCE}" | jq -r '.value')
+          if [ -z "$OIDC_TOKEN" ] || [ "$OIDC_TOKEN" = "null" ]; then
+            echo "::error::OIDC 토큰 발급 실패(id-token: write 권한·audience 확인)"
+            exit 1
+          fi
+          echo "::add-mask::$OIDC_TOKEN"
+
+          echo "→ 배포 요청: target=$TARGET reqId=$REQ_ID digest=$DIGEST"
+          echo "  issued=$ISSUED expires=$EXPIRES bodyDigest=$BODY_DIGEST"
+
+          # 전송 — 서명·digest를 계산한 바로 그 바이트(manifest.json)를 그대로 body로 보낸다.
+          HTTP_CODE=$(curl -sS -o resp.txt -w '%{http_code}' -X POST "$AGENT_URL" \
+            -H "Content-Type: application/json" \
+            -H "X-Deploy-Request-Id: $REQ_ID" \
+            -H "X-Deploy-Issued-At: $ISSUED" \
+            -H "X-Deploy-Expires-At: $EXPIRES" \
+            -H "X-Deploy-Signature: $SIG" \
+            -H "X-Deploy-Oidc-Token: $OIDC_TOKEN" \
+            --data-binary @manifest.json)
+
+          echo "← HTTP $HTTP_CODE"
+          echo "응답 본문:"; cat resp.txt || true; echo
+          {
+            echo "### 배포 요청 결과"
+            echo "- target: \`$TARGET\`  reqId: \`$REQ_ID\`"
+            echo "- 이미지: \`${IMAGE_REPO}@${DIGEST}\`"
+            echo "- compose: \`$(jq -r '.composeRevision' manifest.json)\` (service \`$APP_SERVICE\`)"
+            echo "- HTTP: \`$HTTP_CODE\`"
+            echo "- 응답: \`$(cat resp.txt 2>/dev/null | head -c 300)\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # 2xx만 성공. 그 외는 실패로 드러낸다(조용한 성공 위장 금지).
+          if [[ "$HTTP_CODE" =~ ^2 ]]; then
+            echo "배포 요청 성공 (agent 수신·처리 완료)"
+          else
+            echo "::error::배포 요청 실패 — HTTP $HTTP_CODE ($(cat resp.txt 2>/dev/null | head -c 200))"
+            exit 1
+          fi
